@@ -6,13 +6,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
 
 import matlab.engine
 from aiohttp import web
 
 
-def convert_to_matlab_types(data: Dict[str, Any]) -> Dict[str, Any]:
+def convert_to_matlab_types(data: dict[str, any]) -> dict[str, any]:
     """
     Recursively convert native (numerics) types to MATLAB-compatible types.
     
@@ -43,7 +42,7 @@ def convert_to_matlab_types(data: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def convert_from_matlab_types(data: Dict[str, Any]) -> Dict[str, Any]:
+def convert_from_matlab_types(data: dict[str, any]) -> dict[str, any]:
     """
     Recursively convert MATLAB (numerics) types back to native types.
     
@@ -77,8 +76,8 @@ class TaskPriority(Enum):
 class QueuedTask:
     priority: int
     request_id: str = field(compare=False)
-    data: Dict[str, Any] = field(compare=False)
-    future: asyncio.Future = field(compare=False)
+    data: dict[str, any] = field(compare=False)
+    future: asyncio.Future[any] = field(compare=False)
     timestamp: float = field(default_factory=time.monotonic)
 
 
@@ -86,22 +85,22 @@ class MatlabDaemon:
     """
     Daemon for processing tasks to matlab parfor process
     """
-    def __init__(self, batch_size: int, drain_timeout: float, max_queue_size: int):
+    def __init__(self, batch_size: int, drain_timeout: float, max_queue_size: int) -> None:
         self.batch_size = batch_size
         self.drain_timeout = drain_timeout
         self.max_queue_size = max_queue_size
 
         # Matlab control
         self._task_queue: asyncio.PriorityQueue[QueuedTask] = asyncio.PriorityQueue(maxsize=max_queue_size)
-        self._matlab_engine: Optional[matlab.engine.MatlabEngine] = None
+        self._matlab_engine: matlab.engine.MatlabEngine | None = None
 
-        # State managmnent
-        self._is_running = False
-        self._processing_task: Optional[asyncio.Task] = None
+        # State management
+        self._is_running: bool = False
+        self._processing_task: asyncio.Task[None] | None = None
 
         # Stats
         self._start_time = time.monotonic()
-        self._stats = {
+        self._stats: dict[str, any] = {
             "total_processed": 0,
             "batches_processed": 0,
             "avg_batch_size": 0.0,
@@ -111,11 +110,11 @@ class MatlabDaemon:
         self._log = logging.getLogger("MatlabDaemon")
 
     async def submit_request(
-            self,
-            request_id: str,
-            request_data: Dict[str, Any],
-            priority: TaskPriority = TaskPriority.NORMAL
-    ) -> asyncio.Future:
+        self,
+        request_id: str,
+        request_data: dict[str, any],
+        priority: TaskPriority = TaskPriority.NORMAL
+    ) -> asyncio.Future[dict[str, any]]:
         """
         Create and queue task from request
 
@@ -202,7 +201,7 @@ class MatlabDaemon:
 
     async def _run(self) -> None:
         while self._is_running:
-            batch: List[QueuedTask] = []
+            batch: list[QueuedTask] = []
             self._log.info("Waiting for tasks...")
             try:
                 batch = await self._collect_batch()
@@ -217,8 +216,8 @@ class MatlabDaemon:
                 self._log.error(f"Error: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
-    async def _collect_batch(self) -> List[QueuedTask]:
-        result_batch: List[QueuedTask] = []
+    async def _collect_batch(self) -> list[QueuedTask]:
+        result_batch: list[QueuedTask] = []
         while len(result_batch) < self.batch_size:
             # 1) First attempt to retrieve from a potentially empty queue is blocking,
             #    to avoid wasting resources when there are no tasks.
@@ -235,13 +234,13 @@ class MatlabDaemon:
 
         return result_batch
 
-    async def _process_batch(self, batch: List[QueuedTask]) -> None:
+    async def _process_batch(self, batch: list[QueuedTask]) -> None:
         if not batch or not self._matlab_engine:
             return
 
         # TODO: Convert-zip List[QueuedTask] to two list fnames / params
-        fnames: List[str] = []
-        params: List[Any] = []
+        fnames: list[str] = []
+        params: list[any] = []
         self._log.info("Executing batch...")
         
         # Process tasks
@@ -262,8 +261,8 @@ class MatlabDaemon:
                     task.future.set_exception(result)
                 else:
                     if isinstance(result, dict):
-                        result = change_to_list(result)
-                    task.future.set_result(change_to_list(result))
+                        result = convert_from_matlab_types(result)
+                    task.future.set_result(result)
 
         # Update statistics
         elapsed = time.monotonic() - start_time
@@ -276,7 +275,7 @@ class MatlabDaemon:
         self._log.info(f"Executing batch... Finished in {elapsed:.2f} sec.\t"
                        f"Remaining tasks: {self._task_queue.qsize()}.")
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, any]:
         uptime = time.monotonic() - self._start_time
         return {
             **self._stats,
@@ -323,7 +322,7 @@ def create_app() -> web.Application:
     return app
 
 
-async def handle_post(request):
+async def handle_post(request: web.Request) -> web.Response:
     content = await request.json()
     if content is None:
         return web.json_response({"error": "Invalid JSON"}, status=400)
@@ -332,7 +331,7 @@ async def handle_post(request):
 
     try:
         daemon: MatlabDaemon = request.app["mat_daemon"]
-        json_response = await asyncio.wait_for(await daemon.submit_request(request_id, content), timeout=300)
+        json_response = await asyncio.wait_for(daemon.submit_request(request_id, content), timeout=300)
         return web.json_response(json_response)
     except asyncio.TimeoutError as e:
         return web.json_response({"error": str(e)}, status=408)
