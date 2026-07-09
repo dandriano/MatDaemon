@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 
 import matlab.engine
-from aiohttp import web
+from aiohttp import WSMsgType, web
 
 
 def convert_to_matlab_types(data: dict[str, any]) -> dict[str, any]:
@@ -238,31 +240,28 @@ class MatlabDaemon:
         if not batch or not self._matlab_engine:
             return
 
-        # TODO: Convert-zip List[QueuedTask] to two list fnames / params
-        fnames: list[str] = []
-        params: list[any] = []
+        fnames = [t.data["fname"] for t in batch]
+        params = [convert_to_matlab_types(t.data["params"]) for t in batch]
         self._log.info("Executing batch...")
         
         # Process tasks
         start_time = time.monotonic()
-        is_error = False
         try:
             raw_results = await asyncio.get_running_loop().run_in_executor(
                 None, self._matlab_engine.MatlabProcessorFunc, fnames, params
             )
-        except matlab.engine.MatlabExecutionError as err:
-            raw_results = [err] * len(batch)
-            is_error = True
+        except Exception as err:
+            for task in batch:
+                if not task.future.done():
+                    task.future.set_exception(err)
+            return
 
         # Distribute results
         for task, result in zip(batch, raw_results):
             if not task.future.done():
-                if is_error:
-                    task.future.set_exception(result)
-                else:
-                    if isinstance(result, dict):
-                        result = convert_from_matlab_types(result)
-                    task.future.set_result(result)
+                if isinstance(result, dict):
+                    result = convert_from_matlab_types(result)
+                task.future.set_result(result)
 
         # Update statistics
         elapsed = time.monotonic() - start_time
@@ -280,7 +279,7 @@ class MatlabDaemon:
         return {
             **self._stats,
             "uptime_seconds": uptime,
-            "uptime_readable": f"Uptime: {int(uptime//86400)}d "
+            "uptime_readable": f"{int(uptime//86400)}d "
                                f"{int(uptime%86400//3600)}h "
                                f"{int(uptime%3600//60)}m "
                                f"{int(uptime%60)}s",
@@ -308,41 +307,124 @@ async def cleanup_matlab_daemon(app: web.Application) -> None:
         await app["mat_daemon"].stop()
 
 
-def create_app() -> web.Application:
-    app = web.Application()
-
-    app.add_routes([
-        web.post("/", handle_post),
-        web.get("/", handle_get)
-    ])
-
-    app.on_startup.append(init_matlab_daemon)
-    app.on_cleanup.append(cleanup_matlab_daemon)
-
-    return app
-
-
-async def handle_post(request: web.Request) -> web.Response:
-    content = await request.json()
-    if content is None:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
-
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-
+async def process_job(
+    ws: web.WebSocketResponse,
+    daemon: MatlabDaemon,
+    request_id: str,
+    content: dict[str, any]
+) -> None:
+    """Background task: runs MATLAB job and sends result when done."""
     try:
-        daemon: MatlabDaemon = request.app["mat_daemon"]
-        json_response = await asyncio.wait_for(daemon.submit_request(request_id, content), timeout=300)
-        return web.json_response(json_response)
+        future = await daemon.submit_request(request_id, content)
+        result = await asyncio.wait_for(asyncio.shield(future), timeout=300)
+        await ws.send_json({
+            "type": "result",
+            "request_id": request_id,
+            "data": result
+        })
     except asyncio.TimeoutError as e:
-        return web.json_response({"error": str(e)}, status=408)
+        await ws.send_json({
+            "type": "error",
+            "request_id": request_id,
+            "error": str(e),
+            "code": "TIMEOUT"
+        })
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+        await ws.send_json({
+            "type": "error",
+            "request_id": request_id,
+            "error": str(e),
+            "code": "INTERNAL_ERROR"
+        })
 
+
+async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    daemon: MatlabDaemon = request.app["mat_daemon"]
+    pending_tasks: set[asyncio.Task] = set()
+    
+    try:
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                continue
+                
+            try:
+                data = json.loads(msg.data)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "error": "Invalid JSON"})
+                continue
+            
+            msg_type = data.get("type")
+            request_id = data.get("request_id") or str(uuid.uuid4())
+            
+            if msg_type == "submit":
+                payload = data.get("payload")
+                if payload is None:
+                    await ws.send_json({
+                        "type": "error",
+                        "request_id": request_id,
+                        "error": "Missing payload"
+                    })
+                    continue
+                
+                # Fire off background task so we can keep receiving messages
+                task = asyncio.create_task(
+                    process_job(ws, daemon, request_id, payload),
+                    name=f"job_{request_id}"
+                )
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
+                
+                # Immediate acknowledgment
+                await ws.send_json({
+                    "type": "ack",
+                    "request_id": request_id
+                })
+            
+            elif msg_type == "stats":
+                stats = daemon.get_stats()
+                await ws.send_json({
+                    "type": "stats",
+                    "request_id": request_id,
+                    "data": stats
+                })
+            
+            else:
+                await ws.send_json({
+                    "type": "error",
+                    "request_id": request_id,
+                    "error": f"Unknown type: {msg_type}"
+                })
+                
+    except Exception as e:
+        logging.error(f"WebSocket handler error: {e}")
+    finally:
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        logging.info("WebSocket closed, cleaned up %d pending tasks", len(pending_tasks))
+    
+    return ws
 
 async def handle_get(request: web.Request) -> web.Response:
     daemon = request.app["mat_daemon"]
     stats = daemon.get_stats()
     return web.json_response(stats)
+
+
+def create_app() -> web.Application:
+    app = web.Application()
+
+    app.router.add_get("/", handle_get)
+    app.router.add_get("/ws", handle_websocket)
+
+    app.on_startup.append(init_matlab_daemon)
+    app.on_cleanup.append(cleanup_matlab_daemon)
+
+    return app
 
 
 if __name__ == "__main__":
