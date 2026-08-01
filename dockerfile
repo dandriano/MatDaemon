@@ -13,9 +13,8 @@ USER matlab
 
 WORKDIR /home/matlab
 COPY .env.example .env
-COPY config.py .
-COPY server.py .
+COPY *.py .
 COPY matlab matlab
 
 EXPOSE 8080
-CMD ["python", "-u", "server.py"]
+CMD ["python", "-u", "main.py"]
