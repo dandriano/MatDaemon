@@ -5,8 +5,10 @@ function results = MatlabProcessorFunc(funcNames, paramSets)
     results = cell(n, 1);
 
     p = gcp('nocreate');
-    % TODO: no parpool recreation if maxWorkers changes
     if isempty(p)
+        p = parpool('Threads', maxWorkers);
+    elseif p.NumWorkers ~= maxWorkers
+        delete(p);
         p = parpool('Threads', maxWorkers);
     end
 

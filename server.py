@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from copy import deepcopy
@@ -11,6 +10,7 @@ from enum import Enum
 
 import matlab.engine
 from aiohttp import WSMsgType, web
+from config import CONFIG
 
 
 def convert_to_matlab_types(data: dict[str, any]) -> dict[str, any]:
@@ -87,10 +87,11 @@ class MatlabDaemon:
     """
     Daemon for processing tasks to matlab parfor process
     """
-    def __init__(self, batch_size: int, drain_timeout: float, max_queue_size: int) -> None:
+    def __init__(self, batch_size: int, drain_timeout: float, max_queue_size: int, script_paths: list[str]) -> None:
         self.batch_size = batch_size
         self.drain_timeout = drain_timeout
         self.max_queue_size = max_queue_size
+        self.scripts = script_paths
 
         # Matlab control
         self._task_queue: asyncio.PriorityQueue[QueuedTask] = asyncio.PriorityQueue(maxsize=max_queue_size)
@@ -162,9 +163,8 @@ class MatlabDaemon:
         try:
             self._matlab_engine = matlab.engine.start_matlab()
 
-            # TODO: add matlab util / script paths (programmatically)
-            # but right now assume constant path for our matlab processor
-            self._matlab_engine.addpath(self._matlab_engine.genpath("matlab"))
+            for path in self.scripts:
+                self._matlab_engine.addpath(self._matlab_engine.genpath(path))
             self._log.info(f"Starting MATLAB... Finished in {time.monotonic() - start_time:.2f}")
 
             self._is_running = True
@@ -289,13 +289,11 @@ class MatlabDaemon:
 
 
 async def init_matlab_daemon(app: web.Application) -> None:
-    batch_size = int(os.getenv("MATLAB_DAEMON_CONCURRENCY_LIMIT", "10"))
-    drain_timeout = float(os.getenv("MATLAB_DRAIN_TIMEOUT", "0.4"))
-
     daemon = MatlabDaemon(
-        batch_size=batch_size,
-        drain_timeout=drain_timeout,
-        max_queue_size=1000
+        batch_size=CONFIG["CONCURRENCY_LIMIT"],
+        drain_timeout=CONFIG["DRAIN_TIMEOUT"],
+        max_queue_size=1000,
+        script_paths=CONFIG["SCRIPT_PATHS"]
     )
 
     app["mat_daemon"] = daemon
@@ -428,12 +426,9 @@ def create_app() -> web.Application:
 
 
 if __name__ == "__main__":
-    log_level = os.getenv("LOG_LEVEL", logging.INFO)
-    log_filepath = os.getenv("LOG_FILE_PATH", "./matdaemon.log")
-
-    file_handler = logging.FileHandler(log_filepath)
+    file_handler = logging.FileHandler(CONFIG["LOG_FILE_PATH"])
     console_handler = logging.StreamHandler()
 
-    logging.basicConfig(level=log_level, handlers=[file_handler, console_handler])
+    logging.basicConfig(level=CONFIG["LOG_LEVEL"], handlers=[file_handler, console_handler])
 
-    web.run_app(create_app(), port=int(os.getenv("MATLAB_LISTENING_PORT", 80)))
+    web.run_app(create_app(), port=CONFIG["PORT"])
