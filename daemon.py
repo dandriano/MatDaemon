@@ -41,7 +41,12 @@ class MatlabDaemon:
         self._is_running: bool = False
         self._processing_task: asyncio.Task[None] | None = None
 
-        # Stats
+        # Task lifecycle storage
+        self._tasks: dict[str, QueuedTask] = {}
+        self._queued_order: list[str] = []      # ordered request ids waiting in queue
+        self._processing_ids: set[str] = set()  # currently executing ids
+        self._state_lock = asyncio.Lock()
+
         self._start_time = time.monotonic()
         self._stats: dict[str, any] = {
             "total_processed": 0,
@@ -89,6 +94,11 @@ class MatlabDaemon:
             await asyncio.wait_for(self._task_queue.put(task), timeout=1.0)
         except asyncio.TimeoutError:
             raise RuntimeError("Queue is full, please try again later")
+
+        async with self._state_lock:
+            self._tasks[request_id] = task
+            self._queued_order.append(request_id)
+            self._queued_order.sort(key=lambda rid: (self._tasks[rid].priority, self._tasks[rid].timestamp))
 
         return future
 
@@ -187,6 +197,11 @@ class MatlabDaemon:
                     result_batch.append(await self._task_queue.get())
                 else:
                     result_batch.append(await asyncio.wait_for(self._task_queue.get(), timeout=timeout))
+
+                last = result_batch[-1].request_id
+                async with self._state_lock:
+                    self._queued_order.remove(last)  # if present
+                    self._processing_ids.add(last)
             except asyncio.TimeoutError:
                 break
 
@@ -198,9 +213,9 @@ class MatlabDaemon:
 
         fnames = [t.data["fname"] for t in batch]
         params = [convert_to_matlab_types(t.data["params"]) for t in batch]
+
         self._log.info("Executing batch...")
         
-        # Process tasks
         start_time = time.monotonic()
         try:
             raw_results = await asyncio.get_running_loop().run_in_executor(
@@ -210,16 +225,18 @@ class MatlabDaemon:
             for task in batch:
                 if not task.future.done():
                     task.future.set_exception(err)
+                self._processing_ids.discard(task.request_id)
+                self._tasks.pop(task.request_id, None)
             return
 
-        # Distribute results
         for task, result in zip(batch, raw_results):
             if not task.future.done():
                 if isinstance(result, dict):
                     result = convert_from_matlab_types(result)
                 task.future.set_result(result)
+            self._processing_ids.discard(task.request_id)
+            self._tasks.pop(task.request_id, None)
 
-        # Update statistics
         elapsed = time.monotonic() - start_time
         self._stats["total_processed"] += len(batch)
         self._stats["batches_processed"] += 1
@@ -227,8 +244,16 @@ class MatlabDaemon:
             self._stats["total_processed"] / self._stats["batches_processed"]
             if self._stats["batches_processed"] > 0 else 0)
         self._stats["worktime_seconds"] += elapsed
+
         self._log.info(f"Executing batch... Finished in {elapsed:.2f} sec.\t"
                        f"Remaining tasks: {self._task_queue.qsize()}.")
+
+    def get_task_state(self, request_id: str) -> str:
+        if request_id in self._processing_ids:
+            return "processing"
+        if request_id in self._tasks:
+            return "queued"
+        return "unknown"
 
     def get_stats(self) -> dict[str, any]:
         uptime = time.monotonic() - self._start_time

@@ -1,118 +1,168 @@
-#!/usr/bin/env python3
 import asyncio
 import json
-import logging
+import time
 import uuid
+from dataclasses import dataclass, field
 
-from aiohttp import WSMsgType, web
-from config import CONFIG
-from daemon import MatlabDaemon
+from aiohttp import web
+from daemon import MatlabDaemon, TaskPriority
+
+RESULT_TTL = 300
 
 
-async def process_job(
-    ws: web.WebSocketResponse,
-    daemon: MatlabDaemon,
-    request_id: str,
-    content: dict[str, any]
-) -> None:
-    """Background task: runs MATLAB job and sends result when done."""
+@dataclass
+class TaskHandle:
+    request_id: str
+    future: asyncio.Future
+    fname: str
+    created_at: float = field(default_factory=time.monotonic)
+    finished_at: float | None = None
+
+
+class TaskRegistry:
+    """
+    Bridges HTTP request/response boundaries with the daemon's per-task
+    Future.
+    """
+
+    def __init__(self) -> None:
+        self._handles: dict[str, TaskHandle] = {}
+
+    def register(self, request_id: str, future: asyncio.Future, fname: str) -> TaskHandle:
+        handle = TaskHandle(request_id=request_id, future=future, fname=fname)
+        self._handles[request_id] = handle
+        future.add_done_callback(lambda _: self._schedule_eviction(request_id))
+        return handle
+
+    def get(self, request_id: str) -> TaskHandle | None:
+        return self._handles.get(request_id)
+
+    def _schedule_eviction(self, request_id: str) -> None:
+        handle = self._handles.get(request_id)
+        if handle is None:
+            return
+        handle.finished_at = time.monotonic()
+        asyncio.get_event_loop().call_later(RESULT_TTL, self._handles.pop, request_id, None)
+
+
+def serialize_status(daemon: MatlabDaemon, handle: TaskHandle) -> dict:
+    if not handle.future.done():
+        return {
+            "request_id": handle.request_id,
+            "fname": handle.fname,
+            "status": daemon.get_task_state(handle.request_id),
+        }
+
+    if handle.future.cancelled():
+        return {"request_id": handle.request_id, "fname": handle.fname, "status": "cancelled"}
+
+    exc = handle.future.exception()
+    if exc is not None:
+        return {
+            "request_id": handle.request_id,
+            "fname": handle.fname,
+            "status": "failed",
+            "error": str(exc),
+        }
+
+    return {
+        "request_id": handle.request_id,
+        "fname": handle.fname,
+        "status": "completed",
+        "result": handle.future.result(),
+    }
+
+
+async def handle_task_submit(request: web.Request) -> web.Response:
     try:
-        future = await daemon.submit_request(request_id, content)
-        result = await asyncio.wait_for(asyncio.shield(future), timeout=300)
-        await ws.send_json({
-            "type": "result",
-            "request_id": request_id,
-            "data": result
-        })
-    except asyncio.TimeoutError as e:
-        await ws.send_json({
-            "type": "error",
-            "request_id": request_id,
-            "error": str(e),
-            "code": "TIMEOUT"
-        })
+        data = await request.json()
+        daemon: MatlabDaemon = request.app["mat_daemon"]
+        registry: TaskRegistry = request.app["task_registry"]
+
+        fname = data.get("fname")
+        if not fname:
+            return web.json_response({"error": "'fname' is required"}, status=400)
+        params = data.get("params", {})
+        priority = TaskPriority[data.get("priority", "NORMAL").upper()]
+
+        request_id = str(uuid.uuid4())
+        future = await daemon.submit_request(
+            request_id=request_id,
+            request_data={"fname": fname, "params": params},
+            priority=priority
+        )
+        registry.register(request_id, future, fname)
+
+        return web.json_response(
+            {"request_id": request_id, "status_url": f"/tasks/{request_id}"},
+            status=202
+        )
+
+    except KeyError as e:
+        return web.json_response({"error": f"invalid priority: {e}"}, status=400)
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=503)
     except Exception as e:
-        await ws.send_json({
-            "type": "error",
-            "request_id": request_id,
-            "error": str(e),
-            "code": "INTERNAL_ERROR"
-        })
+        return web.json_response({"error": str(e)}, status=400)
 
 
-async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    
+async def handle_task_status(request: web.Request) -> web.Response:
+    request_id = request.match_info["request_id"]
+    registry: TaskRegistry = request.app["task_registry"]
     daemon: MatlabDaemon = request.app["mat_daemon"]
-    pending_tasks: set[asyncio.Task] = set()
-    
+
+    handle = registry.get(request_id)
+    if handle is None:
+        return web.json_response({"error": "unknown request_id"}, status=404)
+
+    return web.json_response(serialize_status(daemon, handle))
+
+
+async def handle_task_events(request: web.Request) -> web.StreamResponse:
+    """
+    Optional SSE stream, which pushes status transitions and closes on completion.
+    """
+    request_id = request.match_info["request_id"]
+    registry: TaskRegistry = request.app["task_registry"]
+    daemon: MatlabDaemon = request.app["mat_daemon"]
+
+    handle = registry.get(request_id)
+    if handle is None:
+        return web.json_response({"error": "unknown request_id"}, status=404)
+
+    response = web.StreamResponse(
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+    await response.prepare(request)
+
+    async def send(event: dict) -> None:
+        await response.write(f"data: {json.dumps(event)}\n\n".encode())
+
+    last_state = None
     try:
-        async for msg in ws:
-            if msg.type != WSMsgType.TEXT:
-                continue
-                
+        while not handle.future.done():
+            state = daemon.get_task_state(request_id)
+            if state != last_state:
+                await send({"status": state})
+                last_state = state
             try:
-                data = json.loads(msg.data)
-            except json.JSONDecodeError:
-                await ws.send_json({"type": "error", "error": "Invalid JSON"})
-                continue
-            
-            msg_type = data.get("type")
-            request_id = data.get("request_id") or str(uuid.uuid4())
-            
-            if msg_type == "submit":
-                payload = data.get("payload")
-                if payload is None:
-                    await ws.send_json({
-                        "type": "error",
-                        "request_id": request_id,
-                        "error": "Missing payload"
-                    })
-                    continue
-                
-                # Fire off background task so we can keep receiving messages
-                task = asyncio.create_task(
-                    process_job(ws, daemon, request_id, payload),
-                    name=f"job_{request_id}"
-                )
-                pending_tasks.add(task)
-                task.add_done_callback(pending_tasks.discard)
-                
-                # Immediate acknowledgment
-                await ws.send_json({
-                    "type": "ack",
-                    "request_id": request_id
-                })
-            
-            elif msg_type == "stats":
-                stats = daemon.get_stats()
-                await ws.send_json({
-                    "type": "stats",
-                    "request_id": request_id,
-                    "data": stats
-                })
-            
-            else:
-                await ws.send_json({
-                    "type": "error",
-                    "request_id": request_id,
-                    "error": f"Unknown type: {msg_type}"
-                })
-                
-    except Exception as e:
-        logging.error(f"WebSocket handler error: {e}")
+                await asyncio.wait_for(asyncio.shield(handle.future), timeout=2.0)
+            except asyncio.TimeoutError:
+                await response.write(b": heartbeat\n\n")
+
+        await send(serialize_status(daemon, handle))
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
     finally:
-        for task in pending_tasks:
-            task.cancel()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
-        logging.info("WebSocket closed, cleaned up %d pending tasks", len(pending_tasks))
-    
-    return ws
+        await response.write_eof()
+
+    return response
 
 
-async def handle_get(request: web.Request) -> web.Response:
-    daemon = request.app["mat_daemon"]
-    stats = daemon.get_stats()
-    return web.json_response(stats)
+async def handle_statistics(request: web.Request) -> web.Response:
+    daemon: MatlabDaemon = request.app["mat_daemon"]
+    return web.json_response(daemon.get_stats())
