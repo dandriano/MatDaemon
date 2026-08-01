@@ -92,37 +92,47 @@ class MatlabDaemon:
 
         return future
 
-    def start(self) -> None:
+    async def start(self) -> None:
         if self._is_running:
             self._log.warning("Daemon already running")
             return
 
         self._log.info("Starting MATLAB...")
         start_time = time.monotonic()
+        loop = asyncio.get_running_loop()
 
         try:
-            self._matlab_engine = matlab.engine.start_matlab()
+            self._matlab_engine = await loop.run_in_executor(
+                None, 
+                matlab.engine.start_matlab
+            )
 
-            for path in self.scripts:
-                self._matlab_engine.addpath(self._matlab_engine.genpath(path))
+            def configure_engine():
+                for path in self.scripts:
+                    self._matlab_engine.addpath(self._matlab_engine.genpath(path), nargout=0)
+                return self._matlab_engine.feature("numcores")
+
+            num_cores = await loop.run_in_executor(None, configure_engine)
+            
             self._log.info(f"Starting MATLAB... Finished in {time.monotonic() - start_time:.2f}")
 
             self._is_running = True
             self._processing_task = asyncio.create_task(self._run())
-
-            # TODO: use cpu count / batch size to determine size of parfor loop
             self._log.info(f"Batch size: {self.batch_size}\t"
                            f"Drain timeout: {self.drain_timeout}\t"
-                           f"CPU count: {self._matlab_engine.feature("numcores")}")
+                           f"CPU count: {num_cores}")
 
         except Exception as e:
             self._log.error(f"Failed to start MATLAB: {e}")
             self._is_running = False
+            if self._matlab_engine:
+                await loop.run_in_executor(None, self._matlab_engine.quit)
             raise
 
     async def stop(self) -> None:
         self._log.info("Shutting down MATLAB...")
         start_time = time.monotonic()
+        loop = asyncio.get_running_loop()
         self._is_running = False
 
         if self._processing_task:
@@ -133,11 +143,17 @@ class MatlabDaemon:
                 pass
 
         if self._matlab_engine:
-            self._matlab_engine.quit()
+            try:
+                await loop.run_in_executor(None, self._matlab_engine.quit)
+            except Exception as e:
+                self._log.error(f"Error during engine quit: {e}")
+            finally:
+                self._matlab_engine = None
 
         while not self._task_queue.empty():
             task = self._task_queue.get_nowait()
-            task.future.cancel()
+            if not task.future.done():
+                task.future.cancel()
 
         self._log.info(f"Shutting down MATLAB... Finished in {time.monotonic() - start_time:.2f}")
 

@@ -16,7 +16,7 @@ async def init_matlab_daemon(app: web.Application) -> None:
     )
 
     app["mat_daemon"] = daemon
-    daemon.start()
+    await daemon.start()
 
 
 async def cleanup_matlab_daemon(app: web.Application) -> None:
