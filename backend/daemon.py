@@ -1,26 +1,11 @@
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from enum import Enum
 
 import matlab.engine
-from converters import convert_from_matlab_types, convert_to_matlab_types
-
-
-class TaskPriority(Enum):
-    HIGH = 0
-    NORMAL = 1
-    LOW = 2
-
-
-@dataclass(order=True)
-class QueuedTask:
-    priority: int
-    request_id: str = field(compare=False)
-    data: dict[str, any] = field(compare=False)
-    future: asyncio.Future[any] = field(compare=False)
-    timestamp: float = field(default_factory=time.monotonic)
+from backend.converters import convert_from_matlab_types, convert_to_matlab_types
+from backend.registry import MatlabDaemonRegistry
+from backend.task import MatlabDaemonTask, MatlabTaskPriority
 
 
 class MatlabDaemon:
@@ -34,18 +19,13 @@ class MatlabDaemon:
         self.scripts = script_paths
 
         # Matlab control
-        self._task_queue: asyncio.PriorityQueue[QueuedTask] = asyncio.PriorityQueue(maxsize=max_queue_size)
+        self._task_queue: asyncio.PriorityQueue[MatlabDaemonTask] = asyncio.PriorityQueue(maxsize=max_queue_size)
+        self._registry: MatlabDaemonRegistry = MatlabDaemonRegistry()
         self._matlab_engine: matlab.engine.MatlabEngine | None = None
 
         # State management
         self._is_running: bool = False
         self._processing_task: asyncio.Task[None] | None = None
-
-        # Task lifecycle storage
-        self._tasks: dict[str, QueuedTask] = {}
-        self._queued_order: list[str] = []      # ordered request ids waiting in queue
-        self._processing_ids: set[str] = set()  # currently executing ids
-        self._state_lock = asyncio.Lock()
 
         self._start_time = time.monotonic()
         self._stats: dict[str, any] = {
@@ -57,50 +37,25 @@ class MatlabDaemon:
 
         self._log = logging.getLogger("MatlabDaemon")
 
-    async def submit_request(
+    async def submit_task(
         self,
-        request_id: str,
+        task_id: str,
         request_data: dict[str, any],
-        priority: TaskPriority = TaskPriority.NORMAL
-    ) -> asyncio.Future[dict[str, any]]:
-        """
-        Create and queue task from request
-
-        Args:
-            request_id: nuff said
-            request_data: function name and parameters
-            priority: HIGH, NORMAL, LOW
-
-        Returns:
-            asyncio.Future to await results
-
-        Raises:
-            RuntimeError: Queue is full or daemon failed to launch
-        """
+        priority: MatlabTaskPriority = MatlabTaskPriority.NORMAL
+    ) -> MatlabDaemonTask:
         if not self._is_running:
             raise RuntimeError("MATLAB daemon not running")
 
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-
-        task = QueuedTask(
-            priority=priority.value,
-            request_id=request_id,
-            data=request_data,
-            future=future
-        )
-
         try:
+            task = self._registry.register(task_id, request_data, priority.value)
             await asyncio.wait_for(self._task_queue.put(task), timeout=1.0)
+        except KeyError:
+            raise RuntimeError("Duplicate task")
         except asyncio.TimeoutError:
+            self._registry.discard(task)
             raise RuntimeError("Queue is full, please try again later")
 
-        async with self._state_lock:
-            self._tasks[request_id] = task
-            self._queued_order.append(request_id)
-            self._queued_order.sort(key=lambda rid: (self._tasks[rid].priority, self._tasks[rid].timestamp))
-
-        return future
+        return task
 
     async def start(self) -> None:
         if self._is_running:
@@ -169,7 +124,7 @@ class MatlabDaemon:
 
     async def _run(self) -> None:
         while self._is_running:
-            batch: list[QueuedTask] = []
+            batch: list[MatlabDaemonTask] = []
             self._log.info("Waiting for tasks...")
             try:
                 batch = await self._collect_batch()
@@ -184,8 +139,8 @@ class MatlabDaemon:
                 self._log.error(f"Error: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
-    async def _collect_batch(self) -> list[QueuedTask]:
-        result_batch: list[QueuedTask] = []
+    async def _collect_batch(self) -> list[MatlabDaemonTask]:
+        result_batch: list[MatlabDaemonTask] = []
         while len(result_batch) < self.batch_size:
             # 1) First attempt to retrieve from a potentially empty queue is blocking,
             #    to avoid wasting resources when there are no tasks.
@@ -198,16 +153,13 @@ class MatlabDaemon:
                 else:
                     result_batch.append(await asyncio.wait_for(self._task_queue.get(), timeout=timeout))
 
-                last = result_batch[-1].request_id
-                async with self._state_lock:
-                    self._queued_order.remove(last)  # if present
-                    self._processing_ids.add(last)
+                result_batch[-1].is_processing = True
             except asyncio.TimeoutError:
                 break
 
         return result_batch
 
-    async def _process_batch(self, batch: list[QueuedTask]) -> None:
+    async def _process_batch(self, batch: list[MatlabDaemonTask]) -> None:
         if not batch or not self._matlab_engine:
             return
 
@@ -225,8 +177,6 @@ class MatlabDaemon:
             for task in batch:
                 if not task.future.done():
                     task.future.set_exception(err)
-                self._processing_ids.discard(task.request_id)
-                self._tasks.pop(task.request_id, None)
             return
 
         for task, result in zip(batch, raw_results):
@@ -234,8 +184,6 @@ class MatlabDaemon:
                 if isinstance(result, dict):
                     result = convert_from_matlab_types(result)
                 task.future.set_result(result)
-            self._processing_ids.discard(task.request_id)
-            self._tasks.pop(task.request_id, None)
 
         elapsed = time.monotonic() - start_time
         self._stats["total_processed"] += len(batch)
@@ -248,13 +196,6 @@ class MatlabDaemon:
         self._log.info(f"Executing batch... Finished in {elapsed:.2f} sec.\t"
                        f"Remaining tasks: {self._task_queue.qsize()}.")
 
-    def get_task_state(self, request_id: str) -> str:
-        if request_id in self._processing_ids:
-            return "processing"
-        if request_id in self._tasks:
-            return "queued"
-        return "unknown"
-
     def get_stats(self) -> dict[str, any]:
         uptime = time.monotonic() - self._start_time
         return {
@@ -266,4 +207,39 @@ class MatlabDaemon:
                                f"{int(uptime%60)}s",
             "in_queue": self._task_queue.qsize(),
             "active": self._is_running,
+        }
+
+    def get_task_stats(self, task_id: str) -> dict:
+        task = self._registry.get(task_id)
+        if not task:
+            return {
+                "task_id": task_id,
+                "fname": "unknown",
+                "status": "unknown"
+            }
+
+        if task.future.cancelled():
+            return {"task_id": task.task_id, "fname": task.fname, "status": "cancelled"}
+
+        exc = task.future.exception()
+        if exc is not None:
+            return {
+                "task_id": task.task_id,
+                "fname": task.fname,
+                "status": "failed",
+                "error": str(exc),
+            }
+
+        if not task.future.done():
+            return {
+                "task_id": task.task_id,
+                "fname": task.fname,
+                "status": "processing" if task.is_processing else "queued",
+            }
+
+        return {
+            "task_id": task.task_id,
+            "fname": task.fname,
+            "status": "completed",
+            "result": task.future.result(),
         }

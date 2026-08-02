@@ -3,8 +3,8 @@ import logging
 
 from aiohttp import web
 from config import CONFIG
-from daemon import MatlabDaemon
-from server import TaskRegistry, handle_statistics, handle_task_submit, handle_task_status, handle_task_events
+from backend.daemon import MatlabDaemon
+from frontend.server import handle_statistics, handle_task_submit, handle_task_status
 
 
 async def init_matlab_daemon(app: web.Application) -> None:
@@ -26,11 +26,9 @@ async def cleanup_matlab_daemon(app: web.Application) -> None:
 
 def create_app() -> web.Application:
     app = web.Application()
-    app["task_registry"] = TaskRegistry()
 
     app.router.add_post("/tasks", handle_task_submit)
-    app.router.add_get("/tasks/{request_id}", handle_task_status)
-    app.router.add_get("/tasks/{request_id}/events", handle_task_events)
+    app.router.add_get("/tasks/{task_id}", handle_task_status)
     app.router.add_get("/", handle_statistics)
 
     app.on_startup.append(init_matlab_daemon)

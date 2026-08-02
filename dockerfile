@@ -13,8 +13,10 @@ USER matlab
 
 WORKDIR /home/matlab
 COPY .env.example .env
-COPY *.py .
 COPY matlab matlab
+COPY backend backend
+COPY frontend frontend
+COPY *.py .
 
 EXPOSE 8080
 CMD ["python", "-u", "main.py"]
