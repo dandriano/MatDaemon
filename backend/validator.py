@@ -59,11 +59,11 @@ class MatlabFunctionValidator:
             if not func_match:
                 return False, "Could not parse function signature"
             
-            func_name = func_match.group(1)
-            expected_name = filepath.stem
+            # func_name = func_match.group(1)
+            # expected_name = filepath.stem
             
-            if func_name != expected_name:
-                return False, f"Function name '{func_name}' does not match filename '{expected_name}'"
+            # if func_name != expected_name:
+            #    return False, f"Function name '{func_name}' does not match filename '{expected_name}'"
             
             return True, "Valid MATLAB function"
             

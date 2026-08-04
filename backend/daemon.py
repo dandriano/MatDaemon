@@ -243,3 +243,15 @@ class MatlabDaemon:
             "status": "completed",
             "result": task.future.result(),
         }
+
+    async def refresh_scripts(self) -> None:
+        if not self._matlab_engine:
+            return
+         
+        loop = asyncio.get_running_loop()
+        def configure_engine():
+            for path in self.scripts:
+                self._matlab_engine.addpath(self._matlab_engine.genpath(path), nargout=0)
+         
+        await loop.run_in_executor(None, configure_engine)
+        self._log.info("Scripts path refreshed...")

@@ -1,7 +1,62 @@
 import uuid
-
+from pathlib import Path
 from aiohttp import web
 from backend.daemon import MatlabDaemon, MatlabTaskPriority
+from backend.validator import MatlabFunctionValidator
+ 
+ 
+async def handle_script_upload(request: web.Request) -> web.Response:
+    """Handle uploading a new MATLAB script"""
+    daemon: MatlabDaemon = request.app["mat_daemon"]
+    
+
+    raw_path = daemon.scripts[0]
+    target_dir = Path(raw_path)
+    if not target_dir.is_absolute():
+        # Resolve relative to the current working directory (/home/matlab)
+        target_dir = Path.cwd() / raw_path
+    
+    reader = await request.multipart()
+    field = await reader.next()
+    
+    if not field or field.name != "file":
+        return web.json_response({"error": "Expected 'file' field"}, status=400)
+    
+    filename = field.filename
+    if not filename.endswith(".m"):
+        return web.json_response({"error": "Only .m files are allowed"}, status=400)
+    
+    filepath = target_dir / filename
+
+    # TODO: refactor routine below, temp is redundant
+
+    # Write to temp file first for validation
+    temp_path = target_dir / f"temp_{filename}"
+    with open(temp_path, "wb") as f:
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            f.write(chunk)
+            
+    # Validate
+    is_valid, message = MatlabFunctionValidator.validate(temp_path)
+    if not is_valid:
+        temp_path.unlink()
+        return web.json_response({"error": f"Validation failed: {message}"}, status=400)
+    
+    # Move to final location
+    if filepath.exists():
+        filepath.unlink()
+    temp_path.rename(filepath)
+    
+    # Refresh daemon scripts
+    await daemon.refresh_scripts()
+    
+    return web.json_response({
+        "message": "Script uploaded and registered",
+        "fname": filepath.stem
+    })
 
 
 async def handle_task_submit(request: web.Request) -> web.Response:
