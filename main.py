@@ -4,7 +4,7 @@ import logging
 from aiohttp import web
 from config import CONFIG
 from backend.daemon import MatlabDaemon
-from frontend.server import handle_statistics, handle_task_submit, handle_task_status, handle_script_upload
+from frontend.handle import handle_statistics, handle_task_submit, handle_task_status, handle_script_upload
 
 
 async def init_matlab_daemon(app: web.Application) -> None:
