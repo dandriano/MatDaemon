@@ -2,6 +2,7 @@ import uuid
 from pathlib import Path
 from aiohttp import web
 from backend.daemon import MatlabDaemon, MatlabTaskPriority
+from backend.converter import validate_input_value
 from backend.validator import MatlabFunctionValidator
  
  
@@ -22,7 +23,7 @@ async def handle_script_upload(request: web.Request) -> web.Response:
     if not field or field.name != "file":
         return web.json_response({"error": "Expected 'file' field"}, status=400)
     
-    filename = field.filename
+    filename = Path(field.filename or "").name
     if not filename.endswith(".m"):
         return web.json_response({"error": "Only .m files are allowed"}, status=400)
     
@@ -30,25 +31,27 @@ async def handle_script_upload(request: web.Request) -> web.Response:
 
     # TODO: refactor routine below, temp is redundant
 
-    # Write to temp file first for validation
-    temp_path = target_dir / f"temp_{filename}"
-    with open(temp_path, "wb") as f:
-        while True:
-            chunk = await field.read_chunk()
-            if not chunk:
-                break
-            f.write(chunk)
-            
-    # Validate
-    is_valid, message = MatlabFunctionValidator.validate(temp_path)
-    if not is_valid:
-        temp_path.unlink()
-        return web.json_response({"error": f"Validation failed: {message}"}, status=400)
-    
-    # Move to final location
-    if filepath.exists():
-        filepath.unlink()
-    temp_path.rename(filepath)
+    # Write to a uniquely named temp file first for validation
+    temp_path = target_dir / f"temp_{uuid.uuid4().hex}.m"
+    try:
+        with open(temp_path, "wb") as f:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                f.write(chunk)
+
+        # Validate
+        is_valid, message = MatlabFunctionValidator.validate(temp_path)
+        if not is_valid:
+            temp_path.unlink()
+            return web.json_response({"error": f"Validation failed: {message}"}, status=400)
+
+        # Move to final location
+        temp_path.replace(filepath)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
     
     # Refresh daemon scripts
     await daemon.refresh_scripts()
@@ -68,12 +71,20 @@ async def handle_task_submit(request: web.Request) -> web.Response:
         if not fname:
             return web.json_response({"error": "'fname' is required"}, status=400)
         params = data.get("params", {})
+        if not isinstance(params, dict):
+            return web.json_response({"error": "'params' must be an object keyed by MATLAB argument name"}, status=400)
+        try:
+            ordered_params = daemon.bind_named_arguments(fname, params)
+            for name, value in params.items():
+                validate_input_value(value, f"params.{name}")
+        except (TypeError, ValueError) as e:
+            return web.json_response({"error": str(e)}, status=400)
         priority = MatlabTaskPriority[data.get("priority", "NORMAL").upper()]
 
         task_id = str(uuid.uuid4())
         await daemon.submit_task(
             task_id=task_id,
-            request_data={"fname": fname, "params": params},
+            request_data={"fname": fname, "params": ordered_params},
             priority=priority
         )
 
@@ -94,7 +105,9 @@ async def handle_task_status(request: web.Request) -> web.Response:
     task_id = request.match_info["task_id"]
     daemon: MatlabDaemon = request.app["mat_daemon"]
 
-    return web.json_response(daemon.get_task_stats(task_id))
+    stats = daemon.get_task_stats(task_id)
+    status = 404 if stats["status"] == "unknown" else 200
+    return web.json_response(stats, status=status)
 
 
 async def handle_statistics(request: web.Request) -> web.Response:

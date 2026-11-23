@@ -1,8 +1,9 @@
-function results = MatlabProcessorFunc(funcNames, paramSets)
+function [results, errors] = MatlabProcessorFunc(funcNames, paramSets)
     n = length(funcNames);
 
     maxWorkers = max(1, feature('numcores') - 1);
     results = cell(n, 1);
+    errors = cell(n, 1);
 
     p = gcp('nocreate');
     if isempty(p)
@@ -18,8 +19,10 @@ function results = MatlabProcessorFunc(funcNames, paramSets)
         try
             fhandle = str2func(funcNames{ii});
             results{ii} = fhandle(paramSets{ii}{:});
+            errors{ii} = '';
         catch e
-            results{ii} = getReport(e);
+            results{ii} = [];
+            errors{ii} = getReport(e);
         end
     end
 end

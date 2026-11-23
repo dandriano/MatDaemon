@@ -30,8 +30,9 @@ class FakeEngine:
         self.results = results if results is not None else []
         self.quit_called = False
 
-    def MatlabProcessorFunc(self, fnames, params):
-        return self.results
+    def MatlabProcessorFunc(self, fnames, params, nargout):
+        errors = [""] * len(self.results) if isinstance(self.results, list) else []
+        return self.results, errors
 
     def quit(self):
         self.quit_called = True
@@ -87,7 +88,7 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
                 await daemon.submit_task("rejected", {"fname": "Example", "params": {}})
 
         self.assertIsNone(daemon._get_task("rejected"))
-        self.assertEqual(daemon._task_queue.qsize(), 1)
+        self.assertEqual(daemon._work_queue.qsize(), 1)
 
     async def test_completed_tasks_are_evicted_after_ttl(self):
         daemon = self.make_daemon()
@@ -101,15 +102,15 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_parameter_conversion_failure_isolated_to_task(self):
         daemon = self.make_daemon()
-        bad = self.make_task(daemon, "bad", params={"invalid": True})
-        good = self.make_task(daemon, "good", params={"invalid": False})
+        bad = self.make_task(daemon, "bad", params=[True])
+        good = self.make_task(daemon, "good", params=[False])
         engine = FakeEngine(results=["good result"])
         daemon._matlab_engine = engine
 
-        def convert(params):
-            if params["invalid"]:
+        def convert(value):
+            if value:
                 raise ValueError("ragged numeric list")
-            return params
+            return value
 
         with patch.object(daemon_module, "convert_to_matlab_types", side_effect=convert):
             await daemon._process_batch([bad, good])
@@ -172,7 +173,7 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tasks[0].future.result(), "first")
         self.assertEqual(tasks[1].future.result(), "second")
         self.assertIsInstance(tasks[2].future.exception(), RuntimeError)
-        self.assertIn("no result for task at index 2", str(tasks[2].future.exception()))
+        self.assertIn("no result entry for task at index 2", str(tasks[2].future.exception()))
 
     async def test_extra_results_are_ignored_with_warning(self):
         daemon = self.make_daemon()
@@ -183,7 +184,7 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon._process_batch(tasks)
 
         self.assertEqual([task.future.result() for task in tasks], ["first", "second"])
-        self.assertIn("ignoring extra results", logs.output[0])
+        self.assertIn("ignoring extras", logs.output[0])
 
     async def test_malformed_response_types_fail_all_tasks(self):
         for response in (None, {"result": "value"}, ("value",)):
@@ -225,11 +226,11 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
                 self.call_finished = False
                 self.quit_after_call = False
 
-            def MatlabProcessorFunc(self, fnames, params):
+            def MatlabProcessorFunc(self, fnames, params, nargout):
                 call_started.set()
                 release_call.wait(timeout=2)
                 self.call_finished = True
-                return ["active result"]
+                return ["active result"], [""]
 
             def quit(self):
                 self.quit_after_call = self.call_finished
@@ -240,8 +241,8 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
         daemon._matlab_engine = engine
         active = self.make_task(daemon, "active", priority=MatlabTaskPriority.HIGH)
         queued = self.make_task(daemon, "queued", priority=MatlabTaskPriority.LOW)
-        await daemon._task_queue.put(active)
-        await daemon._task_queue.put(queued)
+        await daemon._work_queue.put(active)
+        await daemon._work_queue.put(queued)
         daemon._processing_task = asyncio.create_task(daemon._run())
 
         self.assertTrue(await asyncio.to_thread(call_started.wait, 1))
@@ -258,7 +259,6 @@ class MatlabDaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.future.result(), "active result")
         self.assertTrue(engine.quit_called)
         self.assertTrue(engine.quit_after_call)
-
 
 if __name__ == "__main__":
     unittest.main()

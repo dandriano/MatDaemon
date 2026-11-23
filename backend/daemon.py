@@ -3,46 +3,76 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
 import matlab.engine
-from backend.converter import convert_from_matlab_types, convert_to_matlab_types
+from backend.converter import InputValue, MatlabValue, convert_from_matlab_types, convert_to_matlab_types, validate_input_type
 from backend.task import MatlabDaemonTask, MatlabTaskPriority
+from backend.validator import MatlabFunctionValidator
 
 RESULT_TTL = 300
 QUEUE_PUT_TIMEOUT = 1.0
 
 
-def _convert_batch_results(raw_results: object, expected_count: int) -> list[tuple[bool, object]]:
-    """Convert one engine result per task, keeping conversion failures isolated."""
-    if not isinstance(raw_results, list):
-        raise TypeError(
-            "MATLAB returned malformed batch: expected a Python list, "
-            f"got {type(raw_results).__name__}"
-        )
+def _is_empty_error(error: object) -> bool:
+    return (
+        isinstance(error, (str, list)) and not error
+        or isinstance(error, matlab.double) and 0 in error.size
+    )
 
-    if len(raw_results) > expected_count:
-        logging.getLogger("MatlabDaemon").warning(
-            "MATLAB returned %d results for %d tasks; ignoring extra results",
-            len(raw_results),
-            expected_count,
-        )
+
+def _convert_batch_results(
+    raw_results: object, raw_errors: object, expected_count: int
+) -> list[tuple[bool, object]]:
+    """Map result and error cells to tasks, isolating per-task failures."""
+    for label, values in (("results", raw_results), ("errors", raw_errors)):
+        if not isinstance(values, list):
+            raise TypeError(
+                f"MATLAB returned malformed {label}: expected a Python list, "
+                f"got {type(values).__name__}"
+            )
+
+        if len(values) > expected_count:
+            logging.getLogger("MatlabDaemon").warning(
+                "MATLAB returned %d %s for %d tasks; ignoring extras",
+                len(values),
+                label,
+                expected_count,
+            )
+
+    results = raw_results
+    errors = raw_errors
+    assert isinstance(results, list) and isinstance(errors, list)
 
     converted: list[tuple[bool, object]] = []
     for index in range(expected_count):
-        if index >= len(raw_results):
+        if index >= len(results) or index >= len(errors):
             converted.append((
                 False,
                 RuntimeError(
-                    f"MATLAB returned no result for task at index {index} "
-                    f"({len(raw_results)} results for {expected_count} tasks)"
+                    f"MATLAB returned no {'result' if index >= len(results) else 'error'} "
+                    f"entry for task at index {index} "
+                    f"({len(results)} results, {len(errors)} errors for {expected_count} tasks)"
                 ),
             ))
             continue
 
-        result = raw_results[index]
+        error = errors[index]
+        if not _is_empty_error(error):
+            if isinstance(error, str):
+                converted.append((False, RuntimeError(error)))
+            else:
+                converted.append((
+                    False,
+                    TypeError(
+                        f"MATLAB returned malformed error entry for task at index {index}: "
+                        f"{type(error).__name__}"
+                    ),
+                ))
+            continue
+
         try:
-            if isinstance(result, dict):
-                result = convert_from_matlab_types(result)
+            result = convert_from_matlab_types(results[index])
             converted.append((True, result))
         except Exception as err:
             converted.append((False, err))
@@ -62,6 +92,7 @@ class MatlabDaemon:
         # Matlab control
         self._work_queue: asyncio.PriorityQueue[MatlabDaemonTask] = asyncio.PriorityQueue(maxsize=max_queue_size)
         self._registry: dict[str, MatlabDaemonTask] = {}
+        self._function_metadata: dict[str, tuple[tuple[str, ...], dict[str, str]]] = {}
         self._matlab_engine: matlab.engine.MatlabEngine | None = None
 
         # State management
@@ -170,6 +201,7 @@ class MatlabDaemon:
                 return self._matlab_engine.feature("numcores")
 
             num_cores = await loop.run_in_executor(None, configure_engine)
+            self._refresh_function_metadata()
             
             self._log.info(f"Starting MATLAB... Finished in {time.monotonic() - start_time:.2f}")
 
@@ -324,10 +356,13 @@ class MatlabDaemon:
 
         processable: list[MatlabDaemonTask] = []
         fnames: list[str] = []
-        params: list[dict[str, any]] = []
+        params: list[list[MatlabValue]] = []
         for task in batch:
             try:
-                converted_params = convert_to_matlab_types(task.data["params"])
+                converted_params = [
+                    convert_to_matlab_types(value)
+                    for value in task.data["params"]
+                ]
             except Exception as err:
                 if not task.future.done():
                     task.future.set_exception(err)
@@ -343,11 +378,11 @@ class MatlabDaemon:
         self._log.info("Executing batch...")
         start_time = time.monotonic()
         operation = asyncio.get_running_loop().run_in_executor(
-            None, engine.MatlabProcessorFunc, fnames, params
+            None, lambda: engine.MatlabProcessorFunc(fnames, params, nargout=2)
         )
         self._inflight_operation = operation
         try:
-            raw_results = await asyncio.shield(operation)
+            raw_results, raw_errors = await asyncio.shield(operation)
         except asyncio.CancelledError:
             # Cancelling the coroutine cannot stop the executor thread. Wait for
             # that call to leave MATLAB before allowing the worker to finish.
@@ -367,7 +402,7 @@ class MatlabDaemon:
 
         try:
             converted_results = await asyncio.get_running_loop().run_in_executor(
-                None, _convert_batch_results, raw_results, len(processable)
+                None, _convert_batch_results, raw_results, raw_errors, len(processable)
             )
         except Exception as err:
             for task in processable:
@@ -451,4 +486,49 @@ class MatlabDaemon:
                 self._matlab_engine.addpath(self._matlab_engine.genpath(path), nargout=0)
          
         await loop.run_in_executor(None, configure_engine)
+        self._refresh_function_metadata()
         self._log.info("Scripts path refreshed...")
+
+    def _refresh_function_metadata(self) -> None:
+        """Index local MATLAB function signatures for named API argument binding."""
+        metadata: dict[str, tuple[tuple[str, ...], dict[str, str]]] = {}
+        for raw_path in self.scripts:
+            root = Path(raw_path)
+            if not root.is_absolute():
+                root = Path.cwd() / root
+            paths = sorted(root.rglob("*.m")) if root.is_dir() else ([root] if root.is_file() else [])
+            for filepath in paths:
+                try:
+                    fname, argument_names, argument_types = MatlabFunctionValidator.extract_metadata(filepath)
+                except (OSError, UnicodeDecodeError, ValueError) as err:
+                    self._log.warning("Could not read MATLAB signature from %s: %s", filepath, err)
+                    continue
+                metadata[fname] = (argument_names, argument_types)
+        self._function_metadata = metadata
+        self._log.info("Loaded argument metadata for %d MATLAB functions", len(metadata))
+
+    def bind_named_arguments(
+        self, fname: str, named_params: dict[str, InputValue]
+    ) -> list[InputValue]:
+        """Order named API values according to the MATLAB function declaration."""
+        function_metadata = self._function_metadata.get(fname)
+        if function_metadata is None:
+            raise ValueError(f"Unknown MATLAB function: {fname}")
+        argument_names, argument_types = function_metadata
+
+        expected = set(argument_names)
+        provided = set(named_params)
+        unknown = provided - expected
+        missing = expected - provided
+        if unknown:
+            raise ValueError(f"Unknown argument name(s) for {fname}: {', '.join(sorted(unknown))}")
+        if missing:
+            raise ValueError(f"Missing argument name(s) for {fname}: {', '.join(sorted(missing))}")
+        return [
+            validate_input_type(
+                named_params[name],
+                argument_types.get(name),
+                f"params.{name}",
+            )
+            for name in argument_names
+        ]
